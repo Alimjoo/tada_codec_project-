@@ -1,11 +1,12 @@
 import argparse
 import os
+from dataclasses import asdict
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import CodecConfig
+from config import CodecConfig, resolve_device
 from dataset import AlignedSpeechDataset, collate_fn
 from losses import (
     discriminator_loss,
@@ -18,56 +19,81 @@ from losses import (
 from model import SimpleWaveDiscriminator, TADACodec
 
 
-def train_step(model, disc, batch, opt_g, opt_d, cfg, use_gan: bool):
-    audio = batch["audio"].to(cfg.device)
+def get_autocast_context(device: str, enabled: bool, amp_dtype: str):
+    if not enabled or device != "cuda":
+        return torch.autocast(device_type="cpu", enabled=False)
+    dtype = torch.float16 if amp_dtype == "fp16" else torch.bfloat16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def train_step(model, disc, batch, opt_g, opt_d, scaler_g, scaler_d, cfg, use_gan: bool):
+    audio = batch["audio"].to(cfg.device, dtype=torch.float32)
+    audio_lens = batch["audio_lens"].to(cfg.device)
     text_ids = batch["text_ids"].to(cfg.device)
+    text_lens = batch["text_lens"].to(cfg.device)
     positions = batch["positions"].to(cfg.device)
 
-    out = model(audio, positions)
-    wav_hat = out["wav_hat"]
+    with get_autocast_context(cfg.device, cfg.use_amp, cfg.amp_dtype):
+        out = model(audio, positions, audio_lens, text_lens)
+        wav_hat = out["wav_hat"]
 
-    t = min(audio.size(1), wav_hat.size(1))
-    audio_crop = audio[:, :t]
-    wav_hat_crop = wav_hat[:, :t]
+        t = min(audio.size(1), wav_hat.size(1))
+        audio_crop = audio[:, :t]
+        wav_hat_crop = wav_hat[:, :t]
 
-    loss_mel = mel_loss_fn(wav_hat_crop, audio_crop, cfg)
-    loss_kl = kl_loss_fn(out["mu"], cfg.kl_floor)
-    loss_sem = semantic_loss_fn(out["sem_logits"], positions, text_ids)
+        loss_mel = mel_loss_fn(wav_hat_crop, audio_crop, cfg)
+        loss_kl = kl_loss_fn(out["mu"], out["logvar"], cfg.kl_floor)
+        loss_sem = semantic_loss_fn(out["sem_logits"], positions, text_ids)
 
-    loss_adv = torch.tensor(0.0, device=cfg.device)
-    loss_fm = torch.tensor(0.0, device=cfg.device)
+        loss_adv = torch.tensor(0.0, device=cfg.device)
+        loss_fm = torch.tensor(0.0, device=cfg.device)
 
-    if use_gan:
-        fake_scores, fake_feats = disc(wav_hat_crop)
-        with torch.no_grad():
-            real_scores, real_feats = disc(audio_crop)
-        loss_adv = generator_adv_loss(fake_scores)
-        loss_fm = feature_matching_loss(real_feats, fake_feats)
+        if use_gan:
+            fake_scores, fake_feats = disc(wav_hat_crop)
+            with torch.no_grad():
+                real_scores, real_feats = disc(audio_crop)
+            loss_adv = generator_adv_loss(fake_scores)
+            loss_fm = feature_matching_loss(real_feats, fake_feats)
 
-    loss_g = (
-        cfg.mel_weight * loss_mel
-        + cfg.sem_weight * loss_sem
-        + cfg.kl_weight * loss_kl
-        + cfg.gen_weight * loss_adv
-        + cfg.fm_weight * loss_fm
-    )
+        loss_g = (
+            cfg.mel_weight * loss_mel
+            + cfg.sem_weight * loss_sem
+            + cfg.kl_weight * loss_kl
+            + cfg.gen_weight * loss_adv
+            + cfg.fm_weight * loss_fm
+        )
 
     opt_g.zero_grad(set_to_none=True)
-    loss_g.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-    opt_g.step()
+    if scaler_g is not None:
+        scaler_g.scale(loss_g).backward()
+        scaler_g.unscale_(opt_g)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        scaler_g.step(opt_g)
+        scaler_g.update()
+    else:
+        loss_g.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+        opt_g.step()
 
     loss_d = torch.tensor(0.0, device=cfg.device)
     if use_gan:
         with torch.no_grad():
-            detached_fake = model(audio, positions)["wav_hat"][:, :t]
-        real_scores, _ = disc(audio_crop)
-        fake_scores, _ = disc(detached_fake)
-        loss_d = discriminator_loss(real_scores, fake_scores)
+            detached_fake = model(audio, positions, audio_lens, text_lens)["wav_hat"][:, :t]
+        with get_autocast_context(cfg.device, cfg.use_amp, cfg.amp_dtype):
+            real_scores, _ = disc(audio_crop)
+            fake_scores, _ = disc(detached_fake)
+            loss_d = discriminator_loss(real_scores, fake_scores)
         opt_d.zero_grad(set_to_none=True)
-        loss_d.backward()
-        torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip)
-        opt_d.step()
+        if scaler_d is not None:
+            scaler_d.scale(loss_d).backward()
+            scaler_d.unscale_(opt_d)
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip)
+            scaler_d.step(opt_d)
+            scaler_d.update()
+        else:
+            loss_d.backward()
+            torch.nn.utils.clip_grad_norm_(disc.parameters(), cfg.grad_clip)
+            opt_d.step()
 
     return {
         "loss_g": float(loss_g.item()),
@@ -88,10 +114,18 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--save-dir", type=str, default="checkpoints")
     parser.add_argument("--use-gan", action="store_true")
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp-dtype", type=str, choices=("fp16", "bf16"), default="bf16")
     args = parser.parse_args()
 
     cfg = CodecConfig()
+    cfg.device = resolve_device(args.device)
+    cfg.use_amp = bool(args.amp and cfg.device == "cuda")
+    cfg.amp_dtype = args.amp_dtype
     print("using device:", cfg.device)
+    if cfg.use_amp:
+        print("using amp:", cfg.amp_dtype)
 
     items = torch.load(args.data, map_location="cpu")
     inferred_vocab_size = max(
@@ -117,6 +151,8 @@ def main():
         if args.use_gan
         else None
     )
+    scaler_g = torch.amp.GradScaler("cuda") if cfg.use_amp else None
+    scaler_d = torch.amp.GradScaler("cuda") if cfg.use_amp and args.use_gan else None
 
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -138,7 +174,17 @@ def main():
         pbar = tqdm(dl, desc=f"epoch {epoch}")
         count = 0
         for batch in pbar:
-            stats = train_step(model, disc, batch, opt_g, opt_d, cfg, args.use_gan)
+            stats = train_step(
+                model,
+                disc,
+                batch,
+                opt_g,
+                opt_d,
+                scaler_g,
+                scaler_d,
+                cfg,
+                args.use_gan,
+            )
             count += 1
             for key in running:
                 running[key] += stats[key]
@@ -155,7 +201,7 @@ def main():
 
         ckpt = {
             "model": model.state_dict(),
-            "config": cfg,
+            "config": asdict(cfg),
             "epoch": epoch,
         }
         if args.use_gan:

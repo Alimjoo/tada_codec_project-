@@ -1,17 +1,23 @@
 import argparse
+from dataclasses import fields
 from pathlib import Path
 
 import torch
 import torchaudio
 
-from config import CodecConfig
+from config import CodecConfig, resolve_device
 from model import TADACodec
 
 
 def load_model(ckpt_path: str, device: str):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    cfg = ckpt.get("config", CodecConfig())
-    cfg.device = device
+    raw_cfg = ckpt.get("config", CodecConfig())
+    if isinstance(raw_cfg, dict):
+        valid_fields = {field.name for field in fields(CodecConfig)}
+        cfg = CodecConfig(**{key: value for key, value in raw_cfg.items() if key in valid_fields})
+    else:
+        cfg = raw_cfg
+    cfg.device = resolve_device(device)
 
     model = TADACodec(cfg).to(device)
     model.load_state_dict(ckpt["model"])
@@ -25,7 +31,7 @@ def main():
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="test_outputs")
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
     model, cfg, _ = load_model(args.ckpt, args.device)
@@ -39,9 +45,11 @@ def main():
     sample = items[args.index]
     audio = sample["audio"].unsqueeze(0).to(args.device)
     positions = sample["positions"].unsqueeze(0).to(args.device)
+    audio_lens = torch.tensor([sample["audio"].numel()], device=args.device)
+    text_lens = torch.tensor([sample["text_ids"].numel()], device=args.device)
 
     with torch.no_grad():
-        out = model(audio, positions)
+        out = model(audio, positions, audio_lens, text_lens)
 
     wav_hat = out["wav_hat"][0].detach().cpu()
     wav_ref = sample["audio"].detach().cpu()

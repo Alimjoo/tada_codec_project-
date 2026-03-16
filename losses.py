@@ -5,15 +5,19 @@ from utils import log_mel_spectrogram, extract_aligned_tokens
 
 
 def mel_loss_fn(wav_hat: torch.Tensor, wav: torch.Tensor, cfg) -> torch.Tensor:
-    mel_hat = log_mel_spectrogram(wav_hat, cfg.n_fft, cfg.hop_length, cfg.win_length, cfg.n_mels)
-    mel = log_mel_spectrogram(wav, cfg.n_fft, cfg.hop_length, cfg.win_length, cfg.n_mels)
-    T = min(mel_hat.size(-1), mel.size(-1))
-    return F.l1_loss(mel_hat[..., :T], mel[..., :T])
+    total = 0.0
+    for n_fft, hop_length, win_length in cfg.mel_scales:
+        mel_hat = log_mel_spectrogram(wav_hat, n_fft, hop_length, win_length, cfg.n_mels)
+        mel = log_mel_spectrogram(wav, n_fft, hop_length, win_length, cfg.n_mels)
+        t = min(mel_hat.size(-1), mel.size(-1))
+        total = total + F.l1_loss(mel_hat[..., :t], mel[..., :t])
+    return total / max(len(cfg.mel_scales), 1)
 
 
 
-def kl_loss_fn(mu: torch.Tensor, floor: float = 0.5) -> torch.Tensor:
-    kl = mu.pow(2).mean()
+def kl_loss_fn(mu: torch.Tensor, logvar: torch.Tensor, floor: float = 0.5) -> torch.Tensor:
+    kl = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
+    kl = kl.mean()
     return torch.clamp(kl, min=floor)
 
 

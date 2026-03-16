@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import math
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import torch
 import torchaudio
 from datasets import Audio, load_dataset
+from tqdm import tqdm
 from transformers import AutoModelForCTC, Wav2Vec2BertProcessor
 
 
@@ -44,6 +46,13 @@ def to_mono_16k(audio_array, sample_rate: int) -> torch.Tensor:
     return waveform.squeeze(0).contiguous()
 
 
+def empty_device_cache(device: str):
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if device == "mps" and getattr(torch, "mps", None) is not None:
+        torch.mps.empty_cache()
+
+
 def get_audio_field(audio, key: str, default=None):
     if isinstance(audio, dict):
         return audio.get(key, default)
@@ -71,43 +80,8 @@ def extract_audio_data(audio):
     raise ValueError(f"Unsupported audio representation: {type(audio)!r}")
 
 
-def asr_with_letter_timestamps(waveform: torch.Tensor, processor, model):
-    if waveform.numel() == 0:
-        return {
-            "transcript": "",
-            "letters": [],
-            "num_frames": 0,
-            "sec_per_frame": 0.0,
-            "audio_duration_sec": 0.0,
-        }
-
-    processed = processor(
-        waveform,
-        sampling_rate=TARGET_SAMPLE_RATE,
-        return_tensors="pt",
-        padding=True,
-    )
-
-    model_inputs = {}
-    input_features = processed.get("input_features")
-    if input_features is not None:
-        model_inputs["input_features"] = input_features.to(model.device)
-    else:
-        model_inputs["input_values"] = processed["input_values"].to(model.device)
-
-    with torch.no_grad():
-        logits = model(**model_inputs).logits
-
-    pred_ids = torch.argmax(logits, dim=-1)[0].cpu()
-    num_frames = pred_ids.shape[0]
-    audio_duration_sec = waveform.shape[0] / TARGET_SAMPLE_RATE
-    sec_per_frame = audio_duration_sec / max(num_frames, 1)
-
-    blank_id = processor.tokenizer.pad_token_id
-    if blank_id is None:
-        blank_id = -1
+def decode_ctc_prediction(pred_ids, processor, blank_id, sec_per_frame):
     word_delim = getattr(processor.tokenizer, "word_delimiter_token", "|")
-
     letters = []
     prev_id = None
     run_start = 0
@@ -143,16 +117,108 @@ def asr_with_letter_timestamps(waveform: torch.Tensor, processor, model):
             prev_id = token_id
             run_start = frame_index
 
-    finalize_run(prev_id, run_start, num_frames - 1)
-
+    finalize_run(prev_id, run_start, len(pred_ids) - 1)
     transcription = processor.decode(pred_ids).strip()
-    return {
-        "transcript": transcription,
-        "letters": letters,
-        "num_frames": num_frames,
-        "sec_per_frame": sec_per_frame,
-        "audio_duration_sec": audio_duration_sec,
-    }
+    return transcription, letters
+
+
+def infer_output_lengths(model, model_inputs, logits):
+    if "attention_mask" in model_inputs:
+        input_lengths = model_inputs["attention_mask"].sum(dim=-1)
+    else:
+        first_tensor = next(iter(model_inputs.values()))
+        input_lengths = torch.full(
+            (first_tensor.size(0),),
+            first_tensor.size(1),
+            device=first_tensor.device,
+            dtype=torch.long,
+        )
+
+    if hasattr(model, "_get_feat_extract_output_lengths"):
+        output_lengths = model._get_feat_extract_output_lengths(input_lengths)
+        return output_lengths.to(dtype=torch.long).cpu()
+
+    return torch.full(
+        (logits.size(0),),
+        logits.size(1),
+        dtype=torch.long,
+    )
+
+
+def asr_batch_with_letter_timestamps(waveforms, processor, model):
+    results = []
+    non_empty = [waveform for waveform in waveforms if waveform.numel() > 0]
+    if not non_empty:
+        return [
+            {
+                "transcript": "",
+                "letters": [],
+                "num_frames": 0,
+                "sec_per_frame": 0.0,
+                "audio_duration_sec": 0.0,
+            }
+            for _ in waveforms
+        ]
+
+    processed = processor(
+        waveforms,
+        sampling_rate=TARGET_SAMPLE_RATE,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    model_inputs = {}
+    input_features = processed.get("input_features")
+    if input_features is not None:
+        model_inputs["input_features"] = input_features.to(model.device)
+    else:
+        model_inputs["input_values"] = processed["input_values"].to(model.device)
+    if "attention_mask" in processed:
+        model_inputs["attention_mask"] = processed["attention_mask"].to(model.device)
+
+    with torch.inference_mode():
+        logits = model(**model_inputs).logits
+
+    blank_id = processor.tokenizer.pad_token_id
+    if blank_id is None:
+        blank_id = -1
+    pred_ids_batch = torch.argmax(logits, dim=-1).cpu()
+    output_lengths = infer_output_lengths(model, model_inputs, logits)
+
+    for waveform, pred_ids, output_len in zip(waveforms, pred_ids_batch, output_lengths):
+        if waveform.numel() == 0:
+            results.append(
+                {
+                    "transcript": "",
+                    "letters": [],
+                    "num_frames": 0,
+                    "sec_per_frame": 0.0,
+                    "audio_duration_sec": 0.0,
+                }
+            )
+            continue
+
+        num_frames = max(int(output_len.item()), 1)
+        trimmed_pred_ids = pred_ids[:num_frames]
+        audio_duration_sec = waveform.shape[0] / TARGET_SAMPLE_RATE
+        sec_per_frame = audio_duration_sec / num_frames
+        transcription, letters = decode_ctc_prediction(
+            trimmed_pred_ids,
+            processor,
+            blank_id,
+            sec_per_frame,
+        )
+        results.append(
+            {
+                "transcript": transcription,
+                "letters": letters,
+                "num_frames": num_frames,
+                "sec_per_frame": sec_per_frame,
+                "audio_duration_sec": audio_duration_sec,
+            }
+        )
+
+    return results
 
 
 def letters_to_words(letters):
@@ -199,57 +265,91 @@ def word_to_frame_position(word) -> int:
     return max(0, int(round(midpoint_sec * TARGET_SAMPLE_RATE / HOP_LENGTH)))
 
 
-def build_items(dataset, processor, model, limit: int):
+def build_items(
+    dataset,
+    processor,
+    model,
+    limit: int,
+    batch_size: int,
+    audio_dtype: str,
+    keep_metadata: bool,
+):
     vocab = {"<pad>": 0}
     items = []
+    store_dtype = torch.float16 if audio_dtype == "float16" else torch.float32
+    selected = dataset.select(range(min(limit, len(dataset))))
 
-    for index, sample in enumerate(dataset.select(range(min(limit, len(dataset))))):
-        audio = sample["audio"]
-        audio_array, sample_rate, audio_path = extract_audio_data(audio)
-        waveform = to_mono_16k(audio_array, sample_rate)
-        asr = asr_with_letter_timestamps(waveform, processor, model)
-        words = letters_to_words(asr["letters"])
+    for start in tqdm(range(0, len(selected), batch_size), desc="generate_data", unit="batch"):
+        batch_samples = [selected[idx] for idx in range(start, min(start + batch_size, len(selected)))]
+        prepared = []
+        waveforms = []
+        for local_idx, sample in enumerate(batch_samples):
+            audio = sample["audio"]
+            audio_array, sample_rate, audio_path = extract_audio_data(audio)
+            waveform = to_mono_16k(audio_array, sample_rate)
+            prepared.append(
+                {
+                    "sample": sample,
+                    "audio_path": audio_path,
+                    "sample_index": start + local_idx,
+                    "waveform": waveform,
+                }
+            )
+            waveforms.append(waveform)
 
-        if not words:
-            continue
+        asr_results = asr_batch_with_letter_timestamps(waveforms, processor, model)
 
-        word_ids = []
-        positions = []
-        for word in words:
-            token = word["word"]
-            if token not in vocab:
-                vocab[token] = len(vocab)
-            word_ids.append(vocab[token])
-            positions.append(word_to_frame_position(word))
+        for entry, asr in zip(prepared, asr_results):
+            waveform = entry["waveform"]
+            words = letters_to_words(asr["letters"])
+            if not words:
+                continue
 
-        n_frames = math.ceil(waveform.numel() / HOP_LENGTH)
-        clipped_positions = [min(pos, max(n_frames - 1, 0)) for pos in positions]
+            word_ids = []
+            positions = []
+            for word in words:
+                token = word["word"]
+                if token not in vocab:
+                    vocab[token] = len(vocab)
+                word_ids.append(vocab[token])
+                positions.append(word_to_frame_position(word))
 
-        items.append(
-            {
-                "audio": waveform,
-                "text_ids": torch.tensor(word_ids, dtype=torch.long),
-                "positions": torch.tensor(clipped_positions, dtype=torch.long),
-                "reference_text": sample.get("sentence", ""),
-                "predicted_transcript": asr["transcript"],
-                "words": words,
-                "audio_path": audio_path,
-                "sample_index": index,
-            }
-        )
+            n_frames = math.ceil(waveform.numel() / HOP_LENGTH)
+            clipped_positions = [min(pos, max(n_frames - 1, 0)) for pos in positions]
+
+            items.append(
+                {
+                    "audio": waveform.to(dtype=store_dtype).cpu(),
+                    "text_ids": torch.tensor(word_ids, dtype=torch.long),
+                    "positions": torch.tensor(clipped_positions, dtype=torch.long),
+                    "sample_index": entry["sample_index"],
+                }
+            )
+            if keep_metadata:
+                items[-1]["reference_text"] = entry["sample"].get("sentence", "")
+                items[-1]["predicted_transcript"] = asr["transcript"]
+                items[-1]["words"] = words
+                items[-1]["audio_path"] = entry["audio_path"]
+
+        del batch_samples, prepared, waveforms, asr_results
+        gc.collect()
+        empty_device_cache(str(model.device))
 
     return items, vocab
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=str, default="arhip_program_ug_100.pt")
-    parser.add_argument("--vocab-output", type=str, default="arhip_program_ug_100_vocab.json")
+    parser.add_argument("--output", type=str, default="arhip_program_ug_1000.pt")
+    parser.add_argument("--vocab-output", type=str, default="arhip_program_ug_1000_vocab.json")
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--limit", type=int, default=1000)
     parser.add_argument("--dataset", type=str, default=DATASET_ID)
     parser.add_argument("--model", type=str, default=MODEL_ID)
     parser.add_argument("--hf-token", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--audio-dtype", type=str, choices=("float16", "float32"), default="float16")
+    parser.add_argument("--keep-metadata", action="store_true")
     args = parser.parse_args()
 
     device = get_device()
@@ -262,7 +362,15 @@ def main():
     model = AutoModelForCTC.from_pretrained(args.model, token=args.hf_token).to(device)
     model.eval()
 
-    items, vocab = build_items(dataset, processor, model, args.limit)
+    items, vocab = build_items(
+        dataset,
+        processor,
+        model,
+        args.limit,
+        args.batch_size,
+        args.audio_dtype,
+        args.keep_metadata,
+    )
 
     output_path = Path(args.output)
     vocab_path = Path(args.vocab_output)
