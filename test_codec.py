@@ -43,7 +43,7 @@ def main():
         raise IndexError(f"index {args.index} out of range for dataset of size {len(items)}")
 
     sample = items[args.index]
-    audio = sample["audio"].unsqueeze(0).to(args.device)
+    audio = sample["audio"].unsqueeze(0).to(args.device, dtype=torch.float32)
     positions = sample["positions"].unsqueeze(0).to(args.device)
     audio_lens = torch.tensor([sample["audio"].numel()], device=args.device)
     text_lens = torch.tensor([sample["text_ids"].numel()], device=args.device)
