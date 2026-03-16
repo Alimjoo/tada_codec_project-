@@ -147,6 +147,8 @@ class TADACodec(nn.Module):
 
     def _sample(self, mu: torch.Tensor, logvar: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         std = torch.exp(0.5 * logvar) + self.cfg.latent_std_bias
+        if not self.training:
+            return mu, std
         noise = torch.randn_like(std) * self.cfg.latent_noise_scale
         return mu + std * noise, std
 
